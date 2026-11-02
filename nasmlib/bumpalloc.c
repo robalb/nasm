@@ -30,7 +30,7 @@
 struct hdr { size_t size, pad; };   /* 16 bytes: keeps 16-byte alignment */
 static char *cur, *end;
 
-static void *bump(size_t n, size_t align)
+static __attribute__((noinline)) void *bump_slow(size_t n, size_t align)
 {
     uintptr_t p;
     size_t need;
@@ -49,6 +49,18 @@ static void *bump(size_t n, size_t align)
     ((struct hdr *)p)[-1].size = n;
     cur += need;
     return (void *)p;
+}
+
+static inline void *bump(size_t n, size_t align)
+{
+    uintptr_t p;
+    if (align == 16 && n <= CHUNK && (size_t)(end - cur) >= n + 32) {
+        p = (uintptr_t)cur + sizeof(struct hdr);
+        ((struct hdr *)p)[-1].size = n;
+        cur += sizeof(struct hdr) + ((n + 15) & ~(size_t)15);
+        return (void *)p;
+    }
+    return bump_slow(n, align);
 }
 
 void *malloc(size_t n) { return bump(n, 16); }
