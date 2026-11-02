@@ -108,7 +108,9 @@ sub flush_mac($$)
     my $zblob = Compress::Zlib::compress($data, 9);
     my $zlen = length($zblob);
 
-    if ($zlen >= $dlen) {
+    # x86-64-playground: always store macros uncompressed, avoiding a zlib
+    # inflate of every built-in macro set on each assembly pass.
+    if (1) {
 	$zblob = $data;
 	$zlen = $dlen;
     }
