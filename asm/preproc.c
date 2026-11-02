@@ -1298,6 +1298,64 @@ static void ctx_pop(void)
     nasm_free(c);
 }
 
+struct lazy_mac {
+    struct lazy_mac *next;
+    const char *text;
+    int nlines;
+};
+
+struct lazy_name {
+    struct lazy_mac *list, **tail;
+    uint64_t gen;
+};
+
+static struct hash_table lazy_names;
+static uint64_t lazy_gen;
+static bool lazy_macros;
+static struct src_location lazy_where;
+static uint8_t lazy_filter[512];
+
+static void run_lazy_macros(const struct lazy_mac *lm);
+static void index_all_lazy_macros(void);
+
+static unsigned int lazy_bit(const char *name)
+{
+    unsigned char c = nasm_tolower(name[0]);
+
+    return ((c << 6) ^ (c ? nasm_tolower(name[1]) : 0)) & 4095;
+}
+
+static bool load_lazy_macro(struct hash_table *hash, const char *name)
+{
+    void **p;
+    struct lazy_name *ln;
+    unsigned int bit;
+
+    if (!lazy_macros || (hash != &smacros && hash != &mmacros))
+        return false;
+    bit = lazy_bit(name);
+    if (!(lazy_filter[bit >> 3] & (1 << (bit & 7))))
+        return false;
+    p = hash_findi(&lazy_names, name, NULL);
+    if (!p)
+        return false;
+    ln = *p;
+    if (ln->gen == lazy_gen)
+        return false;
+    ln->gen = lazy_gen;
+    run_lazy_macros(ln->list);
+    return true;
+}
+
+static void **hash_findi_macro(struct hash_table *hash, const char *str)
+{
+    void **p = hash_findi(hash, str, NULL);
+
+    if (!p && load_lazy_macro(hash, str))
+        p = hash_findi(hash, str, NULL);
+    return p;
+}
+
 /*
  * Search for a key in the hash index; adding it if necessary
  * (in which case we initialize the data pointer to NULL.)
@@ -1311,6 +1369,8 @@ hash_findi_add(struct hash_table *hash, const char *str)
     size_t l = strlen(str) + 1;
 
     r = hash_findib(hash, str, l, &hi);
+    if (!r && load_lazy_macro(hash, str))
+        r = hash_findib(hash, str, l, &hi);
     if (r)
         return r;
 
@@ -1329,8 +1389,17 @@ hash_findix(struct hash_table *hash, const char *str)
 {
     void **p;
 
-    p = hash_findi(hash, str, NULL);
+    p = hash_findi_macro(hash, str);
     return p ? *p : NULL;
+}
+
+static void load_all_lazy_macros(void)
+{
+    struct hash_iterator it;
+    const struct hash_node *np;
+
+    hash_for_each(&lazy_names, it, np)
+        load_lazy_macro(&smacros, np->key);
 }
 
 static void inject_predefs(void)
@@ -3736,7 +3805,7 @@ static void undef_smacro(const char *mname, bool undefalias)
 
     ctx = get_ctx(mname, &mname);
     smtbl = ctx ? &ctx->localmac : &smacros;
-    smhead = (SMacro **)hash_findi(smtbl, mname, NULL);
+    smhead = (SMacro **)hash_findi_macro(smtbl, mname);
 
     if (smhead) {
         /*
@@ -3997,6 +4066,7 @@ static void do_clear(enum clear_what what, bool context)
         }
         /* Nothing else can be context-local */
     } else {
+        load_all_lazy_macros();
         if (what & CLEAR_ALLDEFINE)
             clear_smacro_table(&smacros, what);
         if (what & CLEAR_MMACRO)
@@ -5100,7 +5170,7 @@ static int do_directive(Token *tline, Token **output, bool suppressed)
         if (!parse_mmacro_spec(tline, &spec, dname)) {
             goto done;
         }
-        mmac_p = (MMacro **) hash_findi(&mmacros, spec.name, NULL);
+        mmac_p = (MMacro **) hash_findi_macro(&mmacros, spec.name);
         if (!mmac_p) {
             /* No such macro */
             delete_tlist(spec.dlist);
@@ -8508,6 +8578,7 @@ static void pp_start_stdmac(void)
         if (ppdbg & PDBG_INCLUDE)
             dfmt->debug_include(true, istk->next->where, istk->where);
     }
+    lazy_where = istk->where;
 }
 
 static void pp_reset_stdmac(enum preproc_mode mode)
@@ -8518,12 +8589,18 @@ static void pp_reset_stdmac(enum preproc_mode mode)
 
     pp_add_magic_stdmac();
 
-    if (tasm_compatible_mode)
-        pp_add_stdmac(&nasm_stdmac_tasm);
+    lazy_gen++;
+    lazy_macros = !ppdbg && !list_option('b');
+    if (lazy_macros) {
+        index_all_lazy_macros();
+    } else {
+        if (tasm_compatible_mode)
+            pp_add_stdmac(&nasm_stdmac_tasm);
 
-    pp_add_stdmac(&nasm_stdmac_nasm);
-    pp_add_stdmac(&nasm_stdmac_version);
-    pp_add_stdmac(ofmt->stdmac);
+        pp_add_stdmac(&nasm_stdmac_nasm);
+        pp_add_stdmac(&nasm_stdmac_version);
+        pp_add_stdmac(ofmt->stdmac);
+    }
 
     do_predef = true;
 
@@ -8560,6 +8637,7 @@ void pp_reset(const char *file, enum preproc_mode mode,
 {
     cstk = NULL;
     defining = NULL;
+    lazy_macros = false;
     nested_mac_count = 0;
     nested_rep_count = 0;
     unique = 0;
@@ -8623,6 +8701,143 @@ void pp_init(enum preproc_opt opt)
  * istk is NULL then we have reached end of input;
  */
 static Token tok_pop;           /* Dummy token placeholder */
+
+static void add_definition_line(Token *tline)
+{
+    MMacro *mmac = defining->dstk.mmac;
+    Line *l;
+
+    nasm_new(l);
+    l->next = defining->expansion;
+    l->first = tline;
+    l->finishes = NULL;
+    l->where = istk->where;
+    defining->expansion = l;
+
+    /*
+     * Remember if this mmacro expansion contains %00:
+     * if it does, we will have to handle leading labels
+     * specially.
+     */
+    if (mmac) {
+        const Token *t;
+        list_for_each(t, tline) {
+            if (t->type == TOKEN_MMACRO_PARAM &&
+                !memcmp(t->text.a, "%00", 4))
+                mmac->capture_label = true;
+        }
+    }
+}
+
+static void run_lazy_macros(const struct lazy_mac *lm)
+{
+    Include inc, *saved_istk = istk;
+    MMacro *saved_defining = defining;
+
+    nasm_zero(inc);
+    inc.next = istk;
+    inc.where = lazy_where;
+    inc.nolist = inc.noline = true;
+    istk = &inc;
+    defining = NULL;
+    for (; lm; lm = lm->next) {
+        const char *p = lm->text;
+        int n;
+
+        for (n = 0; n < lm->nlines; n++) {
+            size_t len = get_uleb128(&p);
+            char *line = nasm_strndup(p, len);
+            Token *tline, *dtline;
+
+            p += len;
+            tline = tokenize(line);
+            nasm_free(line);
+            if (!defining)
+                tline = expand_mmac_params(tline);
+            if (do_directive(tline, &dtline, false) == DIRECTIVE_FOUND)
+                free_tlist(dtline);
+            else if (defining)
+                add_definition_line(tline);
+            else
+                free_tlist(tline);
+        }
+    }
+    istk = saved_istk;
+    defining = saved_defining;
+}
+
+static bool is_word(const char *w, size_t len, const char *word)
+{
+    return len == strlen(word) && !nasm_strnicmp(w, word, len);
+}
+
+static void index_lazy_macros(macros_t *sm)
+{
+    const char *p;
+    struct lazy_mac *lm = NULL;
+    int depth = 0;
+
+    if (!sm)
+        return;
+    p = sm->dsize == sm->zsize ? sm->zdata : uncompress_stdmac(sm);
+    while (*p) {
+        const char *line = p;
+        size_t len = get_uleb128(&p);
+        const char *end = p + len;
+        const char *w = p, *n;
+        size_t wl, nl;
+
+        p = end;
+        while (w < end && nasm_isspace(*w))
+            w++;
+        for (wl = 0; w + wl < end && !nasm_isspace(w[wl]); wl++)
+            ;
+        if (!depth) {
+            struct lazy_name **slot;
+            char *name;
+            unsigned int bit;
+
+            for (n = w + wl; n < end && nasm_isspace(*n); n++)
+                ;
+            for (nl = 0; n + nl < end && !nasm_isspace(n[nl]) &&
+                     n[nl] != '('; nl++)
+                ;
+            name = nasm_strndup(n, nl);
+            bit = lazy_bit(name);
+            lazy_filter[bit >> 3] |= 1 << (bit & 7);
+            slot = (struct lazy_name **)hash_findi_add(&lazy_names, name);
+            nasm_free(name);
+            if (!*slot) {
+                nasm_new(*slot);
+                (*slot)->tail = &(*slot)->list;
+            }
+            nasm_new(lm);
+            lm->text = line;
+            *(*slot)->tail = lm;
+            (*slot)->tail = &lm->next;
+        }
+        lm->nlines++;
+        if (is_word(w, wl, "%macro") || is_word(w, wl, "%imacro") ||
+            is_word(w, wl, "%rmacro") || is_word(w, wl, "%irmacro"))
+            depth++;
+        else if (is_word(w, wl, "%endmacro") || is_word(w, wl, "%endm"))
+            depth--;
+    }
+}
+
+static void index_all_lazy_macros(void)
+{
+    static bool done;
+
+    if (done)
+        return;
+    done = true;
+    if (tasm_compatible_mode)
+        index_lazy_macros(&nasm_stdmac_tasm);
+    index_lazy_macros(&nasm_stdmac_nasm);
+    index_lazy_macros(&nasm_stdmac_version);
+    index_lazy_macros(ofmt->stdmac);
+}
 
 static Token *pp_tokline(void)
 {
@@ -8840,29 +9055,7 @@ static Token *pp_tokline(void)
              * at all, and just
              * shove the tokenized line on to the macro definition.
              */
-            MMacro *mmac = defining->dstk.mmac;
-            Line *l;
-
-            nasm_new(l);
-            l->next = defining->expansion;
-            l->first = tline;
-            l->finishes = NULL;
-            l->where = istk->where;
-            defining->expansion = l;
-
-            /*
-             * Remember if this mmacro expansion contains %00:
-             * if it does, we will have to handle leading labels
-             * specially.
-             */
-            if (mmac) {
-                const Token *t;
-                list_for_each(t, tline) {
-                    if (t->type == TOKEN_MMACRO_PARAM &&
-                        !memcmp(t->text.a, "%00", 4))
-                        mmac->capture_label = true;
-                }
-            }
+            add_definition_line(tline);
         } else if (suppressed) {
             /*
              * We're in a non-emitting branch of a condition block,
