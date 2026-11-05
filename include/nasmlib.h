@@ -473,7 +473,7 @@ bool nasm_file_exists(const char *filename);
 # undef ZERO_BUF_SIZE
 # define ZERO_BUF_SIZE BUFSIZ
 #endif
-extern const uint8_t zero_buffer[ZERO_BUF_SIZE];
+extern uint8_t zero_buffer[ZERO_BUF_SIZE];
 
 /* Missing fseeko/ftello */
 #ifndef HAVE_FSEEKO

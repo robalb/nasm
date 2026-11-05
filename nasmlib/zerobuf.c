@@ -9,4 +9,4 @@
 #include "nasmlib.h"
 
 /* Uninitialized -> all zero by C spec */
-const uint8_t zero_buffer[ZERO_BUF_SIZE];
+uint8_t zero_buffer[ZERO_BUF_SIZE];
