@@ -47,6 +47,7 @@ enum match_result {
     MERR_REGSETSIZE,
     MERR_REGSET,
     MERR_WRONGIMM,
+    MERR_UNSUPPORTED,
 
     /*
      * Matching successes in decreasing order of fuzziness;
@@ -1106,6 +1107,9 @@ static int64_t assemble(insn *instruction)
             case MERR_INVALOP:
             default:
                 nasm_nonfatal("invalid combination of opcode and operands");
+                break;
+            case MERR_UNSUPPORTED:
+                nasm_nonfatal("instruction not supported by the emulator");
                 break;
             case MERR_OPSIZEINVAL:
                 nasm_nonfatal("invalid operand sizes for instruction");
@@ -3069,6 +3073,8 @@ static enum match_result find_match(const struct itemplate **tempp,
     templist = &nasm_instructions[instruction->opcode];
     n    = templist->ntemp;
     temp = templist->temp;
+    if (!n)
+        return MERR_UNSUPPORTED;
 
     while (n--) {
         m = matches(temp, instruction);

@@ -411,14 +411,16 @@ while (<F>) {
     @field_list = apx_evex_forms(@field_list);
 
     foreach my $fields (@field_list) {
+	if (!defined($k_opcodes{$fields->[0]})) {
+	    $k_opcodes{$fields->[0]} = $n_opcodes++;
+	}
+        next if ($fields->[3] =~ /\b(APX|AVX512\w*|AVX10\w*|AMX\w*|SSE5|3DNOW|CYRIX|MPX)\b/ ||
+                 ($fields->[2] =~ /\b(evex|rex2|vex|xop)\b/ && $fields->[3] !~ /\b(BMI1|BMI2|ADX)\b/));
         ($formatted, $nd) = format_insn(@$fields);
         if ($formatted) {
             $insns++;
 	    xpush(\$aname{$fields->[0]}, [$formatted, $fields]);
         }
-	if (!defined($k_opcodes{$fields->[0]})) {
-	    $k_opcodes{$fields->[0]} = $n_opcodes++;
-	}
         if ($formatted && !$nd) {
             push(@big, [$formatted, $fields]);
             my @sseq = startseq($fields->[2], $fields->[3]);
